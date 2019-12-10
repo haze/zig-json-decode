@@ -26,7 +26,7 @@ pub fn Decodable(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        fn fromJson(allocator: *mem.Allocator, node: var) mem.Allocator.Error!T {
+        pub fn fromJson(allocator: *mem.Allocator, node: var) mem.Allocator.Error!T {
             var item: *T = try allocator.create(T);
             if (info != .Struct) unreachable;
             inline for (info.Struct.fields) |field| {
