@@ -15,7 +15,7 @@ const Skeleton = struct {
 
 const FleshedType = Decodable(Skeleton);
 //...
-const foo = try FleshedType.fromJson(allocator, (try parser.parse(json)).root.Object);
+const foo = try FleshedType.fromJson(.{}, allocator, (try parser.parse(json)).root.Object);
 ```
 
 # TODO
