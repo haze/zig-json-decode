@@ -2,23 +2,8 @@ const std = @import("std");
 const testing = std.testing;
 const mem = std.mem;
 
-const TestSkeleton = struct {
-    int: i64,
-    isCool: bool,
-    float: f64,
-    language: []const u8,
-    optional: ?bool,
-    array: []f64,
-
-    const Bar = struct {
-        nested: []const u8,
-    };
-    complex: Bar,
-
-    const Baz = struct {
-        foo: []const u8,
-    };
-    veryComplex: []Baz,
+const DecodeOptions = struct {
+    ignoreMissing: bool = false,
 };
 
 pub fn Decodable(comptime T: type) type {
@@ -26,15 +11,19 @@ pub fn Decodable(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        pub fn fromJson(allocator: *mem.Allocator, node: var) mem.Allocator.Error!T {
+        const Error = mem.Allocator.Error || error{MissingField};
+
+        pub fn fromJson(options: DecodeOptions, allocator: *mem.Allocator, node: var) Error!T {
             var item: *T = try allocator.create(T);
             if (info != .Struct) unreachable;
+            // hot path for missing
+            if (!options.ignoreMissing and info.Struct.fields.len != node.count()) return error.MissingField;
             inline for (info.Struct.fields) |field| {
                 const fieldTypeInfo = @typeInfo(field.field_type);
                 if (node.get(field.name)) |obj| {
                     if (fieldTypeInfo == .Struct) { // complex json type
                         const generatedType = Decodable(field.field_type);
-                        @field(item, field.name) = try generatedType.fromJson(allocator, obj.value.Object);
+                        @field(item, field.name) = try generatedType.fromJson(options, allocator, obj.value.Object);
                     } else if (fieldTypeInfo == .Pointer and field.field_type != []const u8) { // strings are handled
                         const arrayType = fieldTypeInfo.Pointer.child;
                         const values = obj.value.Array;
@@ -52,7 +41,7 @@ pub fn Decodable(comptime T: type) type {
                         } else {
                             const generatedArrayType = Decodable(arrayType);
                             for (values.toSliceConst()) |value, index| {
-                                dest[index] = try generatedArrayType.fromJson(allocator, value.Object);
+                                dest[index] = try generatedArrayType.fromJson(options, allocator, value.Object);
                             }
                         }
                         @field(item, field.name) = dest;
@@ -66,7 +55,7 @@ pub fn Decodable(comptime T: type) type {
                     } else {
                         assignRawType(item, field.name, field.field_type, obj);
                     }
-                }
+                } else if (!options.ignoreMissing) return error.MissingField;
             }
             return item.*;
         }
@@ -90,7 +79,39 @@ fn assignRawType(destination: var, comptime fieldName: []const u8, comptime fiel
     }
 }
 
+const TestSkeleton = struct {
+    int: i64,
+    isCool: bool,
+    float: f64,
+    language: []const u8,
+    optional: ?bool,
+    array: []f64,
+
+    const Bar = struct {
+        nested: []const u8,
+    };
+    complex: Bar,
+
+    const Baz = struct {
+        foo: []const u8,
+    };
+    veryComplex: []Baz,
+};
 const TestStruct = Decodable(TestSkeleton);
+
+test "NoIgnore works" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator;
+    var p = std.json.Parser.init(allocator, false);
+    defer p.deinit();
+    const tree = try p.parse("{}");
+    const S = Decodable(struct {
+        expected: i64,
+    });
+    const attempt = S.fromJson(.{}, allocator, tree.root.Object);
+    std.testing.expectError(error.MissingField, attempt);
+}
 
 test "Decode works" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -117,8 +138,9 @@ test "Decode works" {
         \\}
     ;
     var p = std.json.Parser.init(allocator, false);
+    defer p.deinit();
     const tree = try p.parse(json);
-    const testStruct = try TestStruct.fromJson(allocator, tree.root.Object);
+    const testStruct = try TestStruct.fromJson(.{}, allocator, tree.root.Object);
     testing.expectEqual(testStruct.int, 420);
     testing.expectEqual(testStruct.float, 3.14);
     testing.expectEqual(testStruct.isCool, true);
