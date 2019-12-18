@@ -2,9 +2,23 @@ const std = @import("std");
 const testing = std.testing;
 const mem = std.mem;
 
-const DecodeOptions = struct {
+const json_key_prefix = "json_";
+
+pub const DecodeOptions = struct {
     ignoreMissing: bool = false,
 };
+
+fn fieldCount(comptime T: type) usize {
+    const typeInfo = @typeInfo(T);
+    if (typeInfo != .Struct) @compileError("Attempted to call fieldCount() on a non struct");
+    comptime var count = 0;
+    inline for (typeInfo.Struct.fields) |field| {
+        if (!mem.startsWith(u8, field.name, json_key_prefix)) {
+            count += 1;
+        }
+    }
+    return count;
+}
 
 pub fn Decodable(comptime T: type) type {
     const info = @typeInfo(T);
@@ -17,17 +31,20 @@ pub fn Decodable(comptime T: type) type {
             var item: *T = try allocator.create(T);
             if (info != .Struct) unreachable;
             // hot path for missing
-            if (!options.ignoreMissing and info.Struct.fields.len != node.count()) return error.MissingField;
+            if (!options.ignoreMissing and fieldCount(T) != node.count()) return error.MissingField;
             inline for (info.Struct.fields) |field| {
+                const maybeJsonMapping = json_key_prefix ++ field.name;
+                const fieldName = field.name;
+                const accessorKey = if (@hasDecl(T, maybeJsonMapping)) @field(T, maybeJsonMapping) else field.name;
                 const fieldTypeInfo = @typeInfo(field.field_type);
-                if (node.get(field.name)) |obj| {
+                if (node.get(accessorKey)) |obj| {
                     if (fieldTypeInfo == .Struct) { // complex json type
                         const generatedType = Decodable(field.field_type);
-                        @field(item, field.name) = try generatedType.fromJson(options, allocator, obj.value.Object);
+                        @field(item, fieldName) = try generatedType.fromJson(options, allocator, obj.value.Object);
                     } else if (fieldTypeInfo == .Pointer and field.field_type != []const u8) { // strings are handled
                         const arrayType = fieldTypeInfo.Pointer.child;
                         const values = obj.value.Array;
-                        var dest = try allocator.alloc(arrayType, values.count());
+                        var dest = try allocator.alloc(arrayType, values.toSliceConst().len);
                         if (isNaiveJSONType(arrayType)) {
                             for (values.toSliceConst()) |value, index| {
                                 dest[index] = switch (arrayType) {
@@ -44,16 +61,16 @@ pub fn Decodable(comptime T: type) type {
                                 dest[index] = try generatedArrayType.fromJson(options, allocator, value.Object);
                             }
                         }
-                        @field(item, field.name) = dest;
+                        @field(item, fieldName) = dest;
                     } else if (fieldTypeInfo == .Optional) {
                         if (obj.value == .Null) {
-                            @field(item, field.name) = null;
+                            @field(item, fieldName) = null;
                         } else {
                             const childType = fieldTypeInfo.Optional.child;
-                            assignRawType(item, field.name, childType, obj);
+                            assignRawType(item, fieldName, childType, obj);
                         }
                     } else {
-                        assignRawType(item, field.name, field.field_type, obj);
+                        assignRawType(item, fieldName, field.field_type, obj);
                     }
                 } else if (!options.ignoreMissing) return error.MissingField;
             }
@@ -98,6 +115,20 @@ const TestSkeleton = struct {
     veryComplex: []Baz,
 };
 const TestStruct = Decodable(TestSkeleton);
+
+test "JSON Mapping works" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = &arena.allocator;
+    var p = std.json.Parser.init(allocator, false);
+    defer p.deinit();
+    const tree = try p.parse("{\"TEST_EXPECTED\": 1}");
+    const S = Decodable(struct {
+        expected: i64,
+        pub const json_expected: []const u8 = "TEST_EXPECTED";
+    });
+    const s = try S.fromJson(.{}, allocator, tree.root.Object);
+}
 
 test "NoIgnore works" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
