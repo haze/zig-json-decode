@@ -28,6 +28,7 @@ const mem = std.mem;
 pub const JsonDumpOptions = struct {
     // TODO: indentation options?
     // TODO: make escaping '/' in strings optional?
+    // TODO: allow picking if []u8 is string or array?
 };
 
 pub fn dump(
@@ -107,14 +108,15 @@ pub fn dump(
                 // TODO: avoid loops?
                 return try dump(value.*, options, context, Errors, output);
             },
+            // TODO: .Many when there is a sentinel (waiting for https://github.com/ziglang/zig/pull/3972)
             .Slice => {
-                if (ptr_info.child == u8) {
-                    // TODO: check for un-encodable utf8 first?
+                if (ptr_info.child == u8 and std.unicode.utf8ValidateSlice(value)) {
                     try output(context, "\"");
-                    for (value) |x, i| {
-                        switch (x) {
+                    var i: usize = 0;
+                    while (i < value.len) : (i += 1) {
+                        switch (value[i]) {
                             // normal ascii characters
-                            0x20...0x21, 0x23...0x2E, 0x30...0x5B, 0x5D...0x7F => try output(context, ([1]u8{x})[0..]),
+                            0x20...0x21, 0x23...0x2E, 0x30...0x5B, 0x5D...0x7F => try output(context, value[i .. i + 1]),
                             // control characters with short escapes
                             '\\' => try output(context, "\\\\"),
                             '\"' => try output(context, "\\\""),
@@ -124,9 +126,27 @@ pub fn dump(
                             '\n' => try output(context, "\\n"),
                             '\r' => try output(context, "\\r"),
                             '\t' => try output(context, "\\t"),
-                            // other control characters
-                            0...0x7, 0xB, 0xE...0x1F => try output(context, ([6]u8{ '\\', 'u', '0', '0', '0', '0' + x })[0..]),
-                            else => @panic("NYI: unicode"),
+                            else => {
+                                const ulen = std.unicode.utf8ByteSequenceLength(value[i]) catch unreachable;
+                                const codepoint = std.unicode.utf8Decode(value[i .. i + ulen]) catch unreachable;
+                                if (codepoint <= 0xFFFF) {
+                                    // If the character is in the Basic Multilingual Plane (U+0000 through U+FFFF),
+                                    // then it may be represented as a six-character sequence: a reverse solidus, followed
+                                    // by the lowercase letter u, followed by four hexadecimal digits that encode the character's code point.
+                                    try output(context, "\\u");
+                                    try std.fmt.formatIntValue(codepoint, "x", std.fmt.FormatOptions{ .width = 4, .fill = '0' }, context, Errors, output);
+                                } else {
+                                    // To escape an extended character that is not in the Basic Multilingual Plane,
+                                    // the character is represented as a 12-character sequence, encoding the UTF-16 surrogate pair.
+                                    const high = @intCast(u16, (codepoint - 0x10000) >> 10) + 0xD800;
+                                    const low = @intCast(u16, codepoint & 0x3FF) + 0xDC00;
+                                    try output(context, "\\u");
+                                    try std.fmt.formatIntValue(high, "x", std.fmt.FormatOptions{ .width = 4, .fill = '0' }, context, Errors, output);
+                                    try output(context, "\\u");
+                                    try std.fmt.formatIntValue(low, "x", std.fmt.FormatOptions{ .width = 4, .fill = '0' }, context, Errors, output);
+                                }
+                                i += ulen - 1;
+                            },
                         }
                     }
                     try output(context, "\"");
@@ -158,19 +178,29 @@ fn testDump(expected: []const u8, value: var) !void {
         expected_remaining: []const u8,
         fn testDumpWrite(context: *@This(), bytes: []const u8) !void {
             if (context.expected_remaining.len < bytes.len) {
-                std.debug.warn("\n====== expected this output: =========\n", .{});
-                std.debug.warn("{}", .{context.expected_remaining});
-                std.debug.warn("\n======== instead found this: =========\n", .{});
-                std.debug.warn("{}", .{bytes});
-                std.debug.warn("\n======================================\n", .{});
+                std.debug.warn(
+                    \\====== expected this output: =========
+                    \\{}
+                    \\======== instead found this: =========
+                    \\{}
+                    \\======================================
+                , .{
+                    context.expected_remaining,
+                    bytes,
+                });
                 return error.TooMuchData;
             }
             if (!mem.eql(u8, context.expected_remaining[0..bytes.len], bytes)) {
-                std.debug.warn("\n====== expected this output: =========\n", .{});
-                std.debug.warn("{}", .{context.expected_remaining[0..bytes.len]});
-                std.debug.warn("\n======== instead found this: =========\n", .{});
-                std.debug.warn("{}", .{bytes});
-                std.debug.warn("\n======================================\n", .{});
+                std.debug.warn(
+                    \\====== expected this output: =========
+                    \\{}
+                    \\======== instead found this: =========
+                    \\{}
+                    \\======================================
+                , .{
+                    context.expected_remaining[0..bytes.len],
+                    bytes,
+                });
                 return error.DifferentData;
             }
             context.expected_remaining = context.expected_remaining[bytes.len..];
@@ -200,6 +230,16 @@ test "dump basic types" {
 
 test "dump string" {
     try testDump("\"hello\"", "hello");
+    try testDump("\"with\\nescapes\\r\"", "with\nescapes\r");
+    try testDump("\"with unicode\\u0001\"", "with unicode\u{1}");
+    try testDump("\"with unicode\\u0080\"", "with unicode\u{80}");
+    try testDump("\"with unicode\\u00ff\"", "with unicode\u{FF}");
+    try testDump("\"with unicode\\u0100\"", "with unicode\u{100}");
+    try testDump("\"with unicode\\u0800\"", "with unicode\u{800}");
+    try testDump("\"with unicode\\u8000\"", "with unicode\u{8000}");
+    try testDump("\"with unicode\\ud799\"", "with unicode\u{D799}");
+    try testDump("\"with unicode\\ud800\\udc00\"", "with unicode\u{10000}");
+    try testDump("\"with unicode\\udbff\\udfff\"", "with unicode\u{10FFFF}");
 }
 
 test "dump tagged unions" {
